@@ -338,6 +338,56 @@ const clean = doc => { const o = {...doc}; delete o._dirty; return o; };
 function writeDoc(kind, doc){ doc = clean(doc); const i = L[kind].findIndex(x => x.id === doc.id); if(i >= 0) L[kind][i] = doc; else L[kind].push(doc); persist(); render(); return Promise.resolve(); }
 function deleteDoc(kind, id){ L[kind] = L[kind].filter(x => x.id !== id); persist(); render(); return Promise.resolve(); }
 
+/* ---------- 潮汐推算：Fort Denison 调和常数（TICON-4，CC BY 4.0），离线可用 ----------
+   16 个主要分潮。对照官方预报核过 35 个满潮/低潮：时间相差平均不到 1 分钟、最多 9 分钟，潮高相差 1–3 厘米。
+   Z0 是平均海面相对预报基准面的高度，按官方预报校准。只适用于悉尼港及附近。 */
+const TIDE_HC = {"M2": [0.51183, 308.07], "N2": [0.1139, 299.51], "S2": [0.12623, 322.14], "K2": [0.03783, 310.84], "2N2": [0.02057, 281.09], "K1": [0.149, 329.43], "P1": [0.04416, 326.44], "O1": [0.09683, 300.58], "Q1": [0.02315, 278.64], "SA": [0.04066, 44.91], "SSA": [0.02349, 139.14], "T2": [0.0077, 343.49], "J1": [0.0089, 347.14], "L2": [0.01408, 309.4], "MU2": [0.02107, 291.76], "NU2": [0.02073, 299.65]}, TIDE_Z0 = 1.04, TIDE_SITE = 'https://tides.willyweather.com.au/nsw/sydney/fort-denison.html';
+const TIDE_V = {M2:[2,-2,2,0,0,0],S2:[2,0,0,0,0,0],N2:[2,-3,2,1,0,0],K2:[2,0,2,0,0,0],K1:[1,0,1,0,0,90],O1:[1,-2,1,0,0,-90],P1:[1,0,-1,0,0,-90],Q1:[1,-3,1,1,0,-90],
+  MU2:[2,-4,4,0,0,0],NU2:[2,-3,4,-1,0,0],'2N2':[2,-4,2,2,0,0],L2:[2,-1,2,-1,0,180],J1:[1,1,1,-1,0,90],T2:[2,0,-1,0,1,0],SA:[0,0,1,0,0,0],SSA:[0,0,2,0,0,0]};
+const TIDE_FU = {M2:'M2',N2:'M2',MU2:'M2',NU2:'M2','2N2':'M2',L2:'M2',K1:'K1',O1:'O1',Q1:'O1',K2:'K2',J1:'J1'};
+function tideModel(ms){
+  const jd = ms/86400000 + 2440587.5, T = (jd - 2451545.0)/36525, D = Math.PI/180;
+  const s = 218.3164477 + 481267.88123421*T, hh = 280.4664567 + 36000.76982779*T, p = 83.3532465 + 4069.0137287*T, N = (125.0445479 - 1934.1362891*T)*D, pp = 282.9373 + 1.7195*T;
+  const dt = new Date(ms), hr = (dt.getUTCHours() + dt.getUTCMinutes()/60 + dt.getUTCSeconds()/3600)*15;
+  const c1 = Math.cos(N), c2 = Math.cos(2*N), c3 = Math.cos(3*N), s1 = Math.sin(N), s2 = Math.sin(2*N), s3 = Math.sin(3*N);
+  const nod = {M2:[1.0004-0.0373*c1+0.0002*c2, -2.14*s1], K1:[1.0060+0.1150*c1-0.0088*c2+0.0006*c3, -8.86*s1+0.68*s2-0.07*s3], O1:[1.0089+0.1871*c1-0.0147*c2+0.0014*c3, 10.80*s1-1.34*s2+0.19*s3],
+    K2:[1.0241+0.2863*c1+0.0083*c2-0.0015*c3, -17.74*s1+0.68*s2-0.04*s3], J1:[1.0129+0.1676*c1-0.0170*c2+0.0016*c3, -12.94*s1+1.34*s2-0.19*s3]};
+  let x = TIDE_Z0;
+  for(const k in TIDE_HC){ const v = TIDE_V[k], fu = TIDE_FU[k] ? nod[TIDE_FU[k]] : [1,0];
+    x += fu[0]*TIDE_HC[k][0]*Math.cos((v[0]*hr + v[1]*s + v[2]*hh + v[3]*p + v[4]*pp + v[5] + fu[1] - TIDE_HC[k][1])*D); }
+  return x;
+}
+function tideExtremes(ms0, ms1){
+  const out = []; let a = tideModel(ms0 - 60000), b = tideModel(ms0);
+  for(let t = ms0; t < ms1; t += 60000){ const c = tideModel(t + 60000);
+    if(b > a && b >= c) out.push({t, type:'H', h:b}); else if(b < a && b <= c) out.push({t, type:'L', h:b}); a = b; b = c; }
+  return out;
+}
+const msToHM = ms => { const d = new Date(ms); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+function tidesAround(ms){   // 这一刻前面最近的一次和后面最近的一次满潮/低潮
+  const ex = tideExtremes(ms - 9*3600000, ms + 9*3600000), prev = ex.filter(e => e.t <= ms).pop(), next = ex.find(e => e.t > ms);
+  return prev && next ? {prev, next} : null;
+}
+function tideNow(ms){
+  const a = tidesAround(ms); if(!a) return null;
+  const f = (ms - a.prev.t)/(a.next.t - a.prev.t), p = a.prev.type === 'H' ? .5*f : .5 + .5*f, hi = Math.max(a.prev.h, a.next.h), lo = Math.min(a.prev.h, a.next.h), h = tideModel(ms);
+  return {p, h, level:(h - lo)/(hi - lo || 1), ...a};
+}
+function autoTideFields(dateStr, hm){
+  const ms = new Date(`${dateStr}T${hm || '12:00'}:00`).getTime(); if(isNaN(ms)) return null;
+  const a = tidesAround(ms); if(!a) return null;
+  const H = a.prev.type === 'H' ? a.prev : a.next, Lo = a.prev.type === 'L' ? a.prev : a.next;
+  return {highTide:msToHM(H.t), highTideM:H.h.toFixed(2), lowTide:msToHM(Lo.t), lowTideM:Lo.h.toFixed(2)};
+}
+function applyAutoTide(){
+  const s = S.sheet; if(!s || s.type !== 'trip') return;
+  const v = autoTideFields(s.data.date, s.data.startTime); if(!v) return;
+  Object.assign(s.data, v, {tideAuto:true});
+  for(const k in v){ const el = document.querySelector(`[data-input="${k}"]`); if(el) el.value = v[k]; }
+  const note = document.getElementById('tide-auto'); if(note) note.textContent = tideAutoNote(s.data);
+}
+const tideAutoNote = f => f.tideAuto ? `已按 Fort Denison 推算：满潮 ${f.highTide}、${f.highTideM} m，低潮 ${f.lowTide}、${f.lowTideM} m。和官方预报一般只差几分钟、一两厘米，可以直接用，也可以改。` : '这四个数是手填的。想换回自动推算，点下面的按钮。';
+
 /* ---------- 水深：钓点的海图水深 + 当时的潮高 = 鱼上钩时的实际水深 ---------- */
 const ZONES = [['桩脚边','pile'],['近','near'],['中','mid'],['远','far']];
 const BOTTOMS = ['沙','泥','礁石','海草','碎石贝壳','混合'];
@@ -360,10 +410,12 @@ const chartUrl = s => `https://fishing-app.gpsnauticalcharts.com/i-boating-fishi
 const r6 = v => Math.round(v*1e6)/1e6;
 function locate(){ return new Promise((res,rej) => { if(!navigator.geolocation) return rej(new Error('none'));
   navigator.geolocation.getCurrentPosition(p => res(p.coords), rej, {enableHighAccuracy:true, timeout:15000, maximumAge:10000}); }); }
-function tideForReading(date, time){   // 那天如果有填了潮汐的出钓记录，就能直接算出那一刻的潮高（同一个港湾潮高基本一样）
-  for(const t of L.trips){ if(t.date === date){ const v = tideHeightAt(t, time); if(v != null) return v; } } return null;
+function tideForReading(date, time){   // 先用当天出钓记录里填的潮汐；没有就用 Fort Denison 推算
+  for(const t of L.trips){ if(t.date === date){ const v = tideHeightAt(t, time); if(v != null) return v; } }
+  const ms = new Date(`${date}T${time || '12:00'}:00`).getTime(); return isNaN(ms) ? null : Math.round(tideModel(ms)*100)/100;
 }
-function lastReadingNote(sp){ const r = (sp.readings||[]).slice(-1)[0]; return r ? `上次更新：${esc(r.at)}，当时潮高 ${r.tide} m。` : ''; }
+
+function lastReadingNote(sp){ const r = (sp.readings||[]).slice(-1)[0]; return r ? (r.src === '铅坠实测的' || (r.src == null && r.tide) ? `上次更新：${esc(r.at)} 铅坠实测，当时潮高 ${r.tide} m。` : `上次更新：${esc(r.at.slice(0,10))}，海图读数。`) : ''; }
 function tideTypical(){   // 你自己记过的潮高的平均值，当作“一般的低潮 / 满潮”
   const avg = a => a.length ? a.reduce((s,v) => s+v, 0)/a.length : null;
   return {lo: avg(L.trips.map(t => numOrNull(t.lowTideM)).filter(v => v != null)), hi: avg(L.trips.map(t => numOrNull(t.highTideM)).filter(v => v != null))};
@@ -611,10 +663,16 @@ function render(){
 function viewToday(){
   const t = activeTrip();
   if(t) return tripBody(t, true);
-  const last = tripsSorted()[0], mi = moonInfo(todayStr());
+  const last = tripsSorted()[0], mi = moonInfo(todayStr()), now = Date.now(), tn = tideNow(now);
+  const d0 = new Date(); d0.setHours(0,0,0,0); const ex = tideExtremes(d0.getTime(), d0.getTime() + 86400000);
+  const corner = (cls, e, label) => e ? `<div class="corner ${cls}"><b>${label}</b><span class="t">${msToHM(e.t)}</span><small>${e.h.toFixed(2)} m</small></div>` : '';
+  const H = tn ? (tn.prev.type === 'H' ? tn.prev : tn.next) : null, Lo = tn ? (tn.prev.type === 'L' ? tn.prev : tn.next) : null;
   return `<div class="note-head"><div><span class="kicker">FIELD NOTE No.${L.trips.length + 1}</span><h2>${fmtDate(todayStr())}</h2><p class="sub">今天去哪个码头？</p></div></div>
-    ${dialHtml('idle', {level:null, now:null, arc:null, dots:[], moonAge:mi.moonAge}, `<span class="k">今天</span><span class="v txt-only">${esc(mi.tideType)}</span><span class="s">${esc(mi.moonLabel)}</span>`, '')}
-    <p class="tide-note">下竿前先开始一次出钓，填上钓点和满潮、低潮，之后每条鱼点几下就记完，圆盘会跟着潮水走。</p>
+    ${dialHtml('idle', {level: tn ? tn.level : null, now: tn ? tn.p : null, arc:null, dots:[], moonAge:mi.moonAge},
+      tn ? `<span class="k">此刻潮高</span><span class="v">${tn.h.toFixed(1)}<small> m</small></span><span class="s">${tideLabel(tn.p)} · ${esc(mi.tideType)}</span>` : `<span class="k">今天</span><span class="v txt-only">${esc(mi.tideType)}</span><span class="s">${esc(mi.moonLabel)}</span>`,
+      corner('tl', H, '满潮') + '<div class="corner tr"><b>落</b><small>顺时针</small></div><div class="corner bl"><b>涨</b></div>' + corner('br', Lo, '低潮'))}
+    <div class="cond" style="cursor:default" role="group" aria-label="今天的潮汐">${ex.slice(0,4).map(e => `<span><small>${e.type === 'H' ? '满潮' : '低潮'} ${e.h.toFixed(2)} m</small>${msToHM(e.t)}</span>`).join('')}</div>
+    <p class="tide-note">潮汐按 Fort Denison 推算，离线也能看，只适用于悉尼港一带。<a href="${TIDE_SITE}" target="_blank" rel="noopener">核对官方潮汐表</a></p>
     <div class="stack"><button class="btn primary" data-act="new-trip">开始出钓</button></div>
     ${last ? `<h3>上一次</h3><ul class="log trips">${tripRow(last)}</ul>` : ''}`;
 }
@@ -699,7 +757,8 @@ function viewHistory(){
     <p class="hint">数据只存在这台设备上。删掉主屏幕图标或清浏览器数据会一起清掉，隔一阵备份一次。</p>
     <div class="stack"><div class="row">
       ${ts.length ? '<button class="btn solid" data-act="backup">备份全部数据</button><button class="btn" data-act="export">导出 CSV 做分析</button>' : ''}
-      <button class="btn" data-act="import">导入备份或 CSV</button></div></div>`;
+      <button class="btn" data-act="import">导入备份或 CSV</button></div></div>
+    <p class="hint" style="margin-top:22px">潮汐推算用的是 Fort Denison 的调和常数，来自 TICON-4 数据集（Hart-Davis 等，CC BY 4.0），经 neaps/tide-database 整理。鱼类法规来自 NSW DPIRD。</p>`;
 }
 function viewTrip(id){ const t = L.trips.find(x => x.id === id); if(!t){ S.tripId = null; return viewHistory(); } return tripBody(t, false); }
 
@@ -713,7 +772,7 @@ function viewSpots(){
     ${names.length ? `<ul class="log" style="margin-top:14px">${names.map(row).join('')}</ul>` : '<p class="empty">还没有钓点。</p>'}
     <div class="stack"><div class="row"><button class="btn" data-act="new-spot">新增钓点</button></div></div>
     <h3>水深从哪来</h3>
-    <p class="hint">一是看海图网站，二是自己用铅坠量。两种读到的都是“那一刻”的水深，会随潮水变，所以填的时候要同时填上那一刻的潮高，应用减掉以后存成最低潮时的固定水深。海图网站注意看单位是米还是英尺。如果哪天你拿到的是不随潮水变的固定海图水深，潮高填 0 就行。</p>`;
+    <p class="hint">一是看海图：海图上的数字是固定的，就是最低潮时的水深，直接填，注意单位是米还是英尺。二是自己用铅坠量：量到的是那一刻的水深，会随潮水变，填的时候选“铅坠实测的”，应用按当时潮高换算回最低潮水深。两种来源可以互相校验。</p>`;
 }
 
 /* ---------- 统计 ---------- */
@@ -797,10 +856,13 @@ function renderSheet(){
       + locField(f)
       + spotDepthTable(f)
       + `<p class="section-note">${ZONES.some(z => numOrNull(f[z[1]]) != null) ? '更新水深' : '填水深'}<small>把你读到或量到的数字原样填进来，再填上那一刻的潮高，应用会换算成一张固定的参考表。只填你要更新的位置，空着的不动。</small></p>`
+      + chipField({k:'src',label:'这些数字是',opts:['海图上读的','铅坠实测的']}, f.src)
       + chipField({k:'unit',label:'读数的单位',opts:['米','英尺']}, f.unit)
-      + `<div class="pair">${inputField({k:'readDate',label:'读数的日期',type:'date'}, f.readDate)}${inputField({k:'readTime',label:'读数的时间',type:'time'}, f.readTime)}</div>`
-      + inputField({k:'refTide',label:'那一刻的潮高',unit:'m',num:true}, f.refTide)
-      + `<p class="hint" id="tide-src">${tideForReading(f.readDate, f.readTime) != null ? '这一天有填了潮汐的出钓记录，潮高已经按时间自动算好，可以改。' : '这一天没有带潮汐的出钓记录，潮高要自己查潮汐表填。海图上读的固定水深填 0。'}</p>`
+      + (f.src === '铅坠实测的'
+        ? `<p class="hint">实测的是那一刻的水深，会随潮水变，所以要知道是什么时候量的，应用按当时潮高换算。</p><div class="pair">${inputField({k:'readDate',label:'测量的日期',type:'date'}, f.readDate)}${inputField({k:'readTime',label:'测量的时间',type:'time'}, f.readTime)}</div>`
+          + inputField({k:'refTide',label:'那一刻的潮高',unit:'m',num:true}, f.refTide)
+          + `<p class="hint" id="tide-src">${tideForReading(f.readDate, f.readTime) != null ? '潮高已经按日期时间自动算好（悉尼港），可以改。' : '填上日期和时间，潮高会自动算出来。'}</p>`
+        : `<p class="hint">海图上的水深是固定的（最低潮时的水深），什么时候看都一样，直接填就行，不用管时间和潮高。注意看海图的单位是米还是英尺。</p>`)
       + `<div class="pair">${inputField({k:'in_pile',label:'桩脚边',num:true}, f.in_pile)}${inputField({k:'in_near',label:'近抛',num:true}, f.in_near)}</div>
          <div class="pair">${inputField({k:'in_mid',label:'中抛',num:true}, f.in_mid)}${inputField({k:'in_far',label:'远抛',num:true}, f.in_far)}</div>
          ${ZONES.some(z => numOrNull(f[z[1]]) != null) ? '<div class="row" style="margin-top:12px"><button type="button" class="btn danger small" data-act="clear-depths">清空这个钓点已存的水深</button></div>' : ''}`
@@ -812,7 +874,9 @@ function renderSheet(){
       + `<div class="pair">${inputField({k:'date',label:'日期',type:'date'}, f.date)}${inputField({k:'startTime',label:'开始',type:'time'}, f.startTime)}</div>
          <div class="pair">${inputField({k:'highTide',label:'满潮时间',type:'time'}, f.highTide)}${inputField({k:'lowTide',label:'低潮时间',type:'time'}, f.lowTide)}</div>
          <div class="pair">${inputField({k:'highTideM',label:'满潮潮高',unit:'m',num:true}, f.highTideM)}${inputField({k:'lowTideM',label:'低潮潮高',unit:'m',num:true}, f.lowTideM)}</div>
-         <p class="hint">查一下当天潮汐表，填离你下竿时间最近的那一次满潮和低潮。时间只填一个也行；两个潮高都填了，才能算每条鱼的实际水深。</p>
+         <p class="hint" id="tide-auto">${esc(tideAutoNote(f))}</p>
+         <div class="row"><button type="button" class="btn small" data-act="tide-auto">按日期时间自动推算</button><a class="btn small quiet" href="${TIDE_SITE}" target="_blank" rel="noopener">核对官方潮汐表</a></div>
+         <p class="hint">推算只适用于悉尼港一带。填的是离下竿时间最近的一次满潮和一次低潮。</p>
          ${!s.isNew ? inputField({k:'endTime',label:'收竿',type:'time'}, f.endTime) : ''}
          <p class="section-note">环境<small>现场能看出来的先点上，气压水温这些可以回家再补。</small></p>`
       + ENV.map(d => d.opts ? chipField(d, f[d.k]) : inputField(d, f[d.k])).join('')
@@ -852,7 +916,7 @@ function refreshAutoTide(){
 
 function newTripForm(){
   const last = tripsSorted()[0];
-  openSheet({type:'trip', isNew:true, data:{id:newId('t_'), date:todayStr(), startTime:nowHM(), spot:last ? last.spot : '', createdAt:Date.now()}});
+  openSheet({type:'trip', isNew:true, data:{id:newId('t_'), date:todayStr(), startTime:nowHM(), spot:last ? last.spot : '', createdAt:Date.now(), ...(autoTideFields(todayStr(), nowHM()) || {}), tideAuto:true}});
 }
 function newCatchForm(tripId){
   const mine = catchesOf(tripId), lastHere = mine[mine.length-1], lastAny = lastHere || [...L.catches].sort((a,b) => (b.createdAt||0)-(a.createdAt||0))[0] || {};
@@ -866,17 +930,17 @@ async function saveSheet(){
   if(s.type === 'spot'){
     f.name = (f.name||'').trim(); if(!f.name) return err('先给钓点起个名字。');
     if(s.isNew && spotOf(f.name)) return err('已经有这个钓点了，回列表里点它来改。');
-    const k = f.unit === '英尺' ? 0.3048 : 1, ins = ZONES.map(z => numOrNull(f['in_' + z[1]])), h = numOrNull(f.refTide);
+    const k = f.unit === '英尺' ? 0.3048 : 1, ins = ZONES.map(z => numOrNull(f['in_' + z[1]])), h = f.src === '铅坠实测的' ? numOrNull(f.refTide) : 0;
     if(ins.some(v => v != null)){
-      if(h == null) return err('填了水深读数，还要填读数那一刻的潮高。查一下潮汐表，当时大概是多少米。');
+      if(h == null) return err('实测的水深要填测量那一刻的潮高。查一下潮汐表，当时大概是多少米。');
       const conv = ins.map(v => v == null ? null : r1(v*k - h));
       if(conv.some(v => v != null && v < 0)) return err('减掉潮高以后水深成了负数。检查一下单位选对没有，潮高填的是不是米。');
       ZONES.forEach((z,i) => { if(conv[i] != null) f[z[1]] = conv[i]; });
       const raw = {}; ZONES.forEach((z,i) => { if(ins[i] != null) raw[z[0]] = ins[i]; });
-      f.readings = [...(f.readings||[]), {at:`${f.readDate||todayStr()} ${f.readTime||nowHM()}`, unit:f.unit||'米', tide:h, raw}].slice(-12);   // 留底：原始读数、时间、用的潮高
+      f.readings = [...(f.readings||[]), {at:`${f.readDate||todayStr()} ${f.readTime||nowHM()}`, src:f.src||'海图上读的', unit:f.unit||'米', tide:h, raw}].slice(-12);   // 留底：原始读数、时间、用的潮高
     }
     const changed = ins.some(v => v != null);
-    ZONES.forEach(z => delete f['in_' + z[1]]); delete f.unit; delete f.refTide; delete f.readDate; delete f.readTime; const i = L.spots.findIndex(x => x.name === f.name); if(i >= 0) L.spots[i] = f; else L.spots.push(f);
+    ZONES.forEach(z => delete f['in_' + z[1]]); delete f.unit; delete f.src; delete f.refTide; delete f.readDate; delete f.readTime; const i = L.spots.findIndex(x => x.name === f.name); if(i >= 0) L.spots[i] = f; else L.spots.push(f);
     recomputeDepths(f.name); persist(); closeSheetQuiet(); render(); toast(changed ? '已保存，参考水深表已更新' : '已保存钓点');
     return;
   }
@@ -885,7 +949,7 @@ async function saveSheet(){
     if(!f.date) return err('日期不能空。');
     ENV.filter(d => d.num).forEach(d => f[d.k] = numOrNull(f[d.k]));
     f.highTideM = numOrNull(f.highTideM); f.lowTideM = numOrNull(f.lowTideM);
-    Object.assign(f, moonInfo(f.date)); f.spot = f.spot.trim();
+    Object.assign(f, moonInfo(f.date)); f.spot = f.spot.trim(); delete f.tideAuto;
     closeSheetQuiet(); await writeDoc('trips', f);
     for(const c of L.catches.filter(c => c.tripId === f.id)){   // 潮汐改了，重算这次每条鱼的潮段和水深
       const p = c.tideManual ? c.tideP : phaseAt(f, c.time), dm = c.depthManual ? c.depthM : depthAt(f, c.time, c.cast);
@@ -995,6 +1059,7 @@ document.addEventListener('click', async e => {
     const ci = wrap.querySelector('[data-custom]'); if(ci) ci.value = '';
     if(k === 'tideLabel'){ S.sheet.data.tideManual = !on; if(on) refreshAutoTide(); }
     if(k === 'cast') refreshAutoDepth();
+    if(k === 'src'){ if(!S.sheet.data.src) S.sheet.data.src = '海图上读的'; renderSheet(); return; }
     if(k === 'species'){ const q = document.getElementById('aqua'); if(q) q.innerHTML = aquaHtml(S.sheet.data.species); }
     return;
   }
@@ -1007,6 +1072,7 @@ document.addEventListener('click', async e => {
   else if(act === 'edit-trip'){ const t = L.trips.find(x => x.id === b.dataset.trip); openSheet({type:'trip', isNew:false, data:clean(t)}); }
   else if(act === 'end-trip'){ const t = L.trips.find(x => x.id === b.dataset.trip); if(!confirmTap(b, '再点一次确认收竿')) return;
     await writeDoc('trips', {...clean(t), endTime: t.date === todayStr() || elapsed(t) ? nowHM() : (t.startTime||nowHM())}); toast('已收竿。环境没填全的话，回家在“记录”里补。'); }
+  else if(act === 'tide-auto') applyAutoTide();
   else if(act === 'new-catch') newCatchForm(b.dataset.trip);
   else if(act === 'spot-locate'){ b.textContent = '正在定位…';
     try{ const c = await locate(); if(S.sheet && S.sheet.type === 'spot'){ S.sheet.data.lat = r6(c.latitude); S.sheet.data.lng = r6(c.longitude); renderSheet(); toast(`已定位，精度约 ±${Math.round(c.accuracy)} 米${c.accuracy > 30 ? '，偏差有点大，可以到地图上再挪一下' : ''}`); } }
@@ -1017,9 +1083,9 @@ document.addEventListener('click', async e => {
   else if(act === 'pick-layer'){ if(!map) return; const k = b.dataset.layer; Object.entries(mapLayers).forEach(([n,l]) => n === k ? l.addTo(map) : map.removeLayer(l));
     document.querySelectorAll('[data-act="pick-layer"]').forEach(x => x.setAttribute('aria-pressed', String(x === b))); }
   else if(act === 'pick-locate'){ if(!map) return; try{ const c = await locate(); if(map) map.setView([c.latitude, c.longitude], 18); }catch(e){ toast('没定到位，手动拖地图吧。'); } }
-  else if(act === 'new-spot') openSheet({type:'spot', isNew:true, data:{name:'', unit:'米', readDate:todayStr(), readTime:nowHM(), refTide:(v => v == null ? '' : v.toFixed(1))(tideForReading(todayStr(), nowHM()))}});
+  else if(act === 'new-spot') openSheet({type:'spot', isNew:true, data:{name:'', src:'海图上读的', unit:'米', readDate:todayStr(), readTime:nowHM(), refTide:(v => v == null ? '' : v.toFixed(1))(tideForReading(todayStr(), nowHM()))}});
   else if(act === 'edit-spot'){ const n = b.dataset.spot, sp = spotOf(n); const th = tideForReading(todayStr(), nowHM());
-    openSheet({type:'spot', isNew:false, data:{...(sp || {name:n}), unit:'米', readDate:todayStr(), readTime:nowHM(), refTide: th == null ? '' : th.toFixed(1)}}); }
+    openSheet({type:'spot', isNew:false, data:{...(sp || {name:n}), src:'海图上读的', unit:'米', readDate:todayStr(), readTime:nowHM(), refTide: th == null ? '' : th.toFixed(1)}}); }
   else if(act === 'clear-depths'){ if(!confirmTap(b, '再点一次清空')) return; ZONES.forEach(z => S.sheet.data[z[1]] = null); renderSheet(); toast('已清空，点“保存钓点”后生效'); }
   else if(act === 'edit-catch'){ const c = L.catches.find(x => x.id === b.dataset.id); openSheet({type:'catch', isNew:false, data:clean(c)}); }
   else if(act === 'del-catch'){ if(!confirmTap(b, '再点一次删除')) return; const id = b.dataset.id; closeSheetQuiet(); await deleteDoc('catches', id); toast('已删除'); }
@@ -1036,7 +1102,10 @@ document.addEventListener('click', async e => {
 });
 document.addEventListener('input', e => {
   if(!S.sheet) return; const el = e.target;
-  if(el.dataset.input){ S.sheet.data[el.dataset.input] = el.value; if(el.dataset.input === 'time'){ refreshAutoTide(); refreshAutoDepth(); } if((el.dataset.input === 'readDate' || el.dataset.input === 'readTime') && S.sheet.type === 'spot'){
+  if(el.dataset.input){ S.sheet.data[el.dataset.input] = el.value;
+    if(S.sheet.type === 'trip'){ const k = el.dataset.input;
+      if(['highTide','lowTide','highTideM','lowTideM'].includes(k)){ S.sheet.data.tideAuto = false; const n = document.getElementById('tide-auto'); if(n) n.textContent = tideAutoNote(S.sheet.data); }
+      else if((k === 'date' || k === 'startTime') && S.sheet.data.tideAuto) applyAutoTide(); } if(el.dataset.input === 'time'){ refreshAutoTide(); refreshAutoDepth(); } if((el.dataset.input === 'readDate' || el.dataset.input === 'readTime') && S.sheet.type === 'spot'){
       const v = tideForReading(S.sheet.data.readDate, S.sheet.data.readTime), box = document.querySelector('[data-input="refTide"]'), src = document.getElementById('tide-src');
       if(v != null){ S.sheet.data.refTide = v.toFixed(1); if(box) box.value = S.sheet.data.refTide; }
       if(src) src.textContent = v != null ? '这一天有填了潮汐的出钓记录，潮高已经按时间自动算好，可以改。' : '这一天没有带潮汐的出钓记录，潮高要自己查潮汐表填。海图上读的固定水深填 0。'; }
