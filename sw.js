@@ -1,5 +1,5 @@
 // 离线缓存。改了 index.html 之后把下面的版本号加一，手机上重开两次应用就会换成新版。
-const VERSION = 'wharflog-v10';
+const VERSION = 'wharflog-v11';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
